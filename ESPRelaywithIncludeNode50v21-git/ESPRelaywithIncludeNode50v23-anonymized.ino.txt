@@ -1,0 +1,142 @@
+#include <CRC32.h>
+#include <Manchester.h>
+#include <DiOremote.h>
+//#include <avr/io.h>
+#include <DHT.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+/*
+ * Use IRremote library from https://github.com/z3t0/Arduino-IRremote/archive/master.zip 
+ * by default,the IR LEDs are connected to Arduino PWM pin 3. but I had to change it as it conflicts with the manchester library timer. 
+ * the IRremote library has therefore been updated to use pin 9. 
+ * Originally by Pascal Olin may 2019
+ * modified summer 2020 to remove non node specific functions, all functions are now run by the GenericHomerRelay.v??.h library located in the ../../nano/libraries folder (use latest version) 
+ * modified november 2021 to enhance self contain documentation, move led pins to Analog (unused) pins to freeup digital pins
+ * modified november 2021 to allow relays to report their status. 
+ * **** Attention this version is now incompatible with version < 20 ****
+ * modified mid 2023 to replace arduino module by ESP8266, therefore using Wifi instead of RF433, more reliable for home automation (and dirt cheap) 
+ */
+//#include <IRremote.h>
+//IRsend irsend;
+#define DEBUG 
+#define NODEBUG 
+#undef DEBUG
+#define DHTPRESENT
+#undef DHTPRESENT
+#ifdef NODEBUG
+#define SerialprintF(x) Serial.print(F(x));
+#define SerialprintlnF(x) Serial.println(F(x));
+#define Serialprint(x) Serial.print(x);
+#define Serialprintln(x) Serial.println(x);
+
+#else
+#define Serialprint(x) ;
+#define Serialprintln(x) ;
+#define SerialprintF(x) ;
+#define SerialprintlnF(x) ;
+#endif
+
+#if defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
+#define Serialprint(x) x;
+#define Serialprintln(x) x;
+#define SerialprintF(x) ;
+#define SerialprintlnF(x) ;
+
+#else
+#define Serialprint(x) Serial.print(x);
+#define Serialprintln(x) Serial.println(x);
+#endif
+ 
+/****************************************************************************************************************************\
+ *
+ * NodeMCU Expected wiring :  
+ *                                       USB 
+ *                                  _____|  |____
+ *                 <===  3.3v Out -|     |__|    |- Vin           ==>
+ *                 <===       GND -|             |- GND.          ==>               
+ *                 <===  GPIO1    -|TX           |- Chip_EN  0    ==> 
+ *                 <===  GPIO3    -|RX           |- EXT_RSTb      ==>
+ *   Feeder PWM    <===  GPIO15   -|D8           |- 3.3v Out      ==>                         
+ *   Left PWM      <===  GPIO13   -|D7        GND|- GND           ==>                         
+ *   HX711 CLK     <===  GPIO12   -|D6        SK |- GPIO6         ==>               
+ *   Lock PWMk     <===  GPIO14   -|D5        SD0|- GPIO7         ==>                 
+ *                 <===  GND      -|          SC |- GPIO11        ==>                  
+ *                 <===  3.3v Out -|          SD1|- GPIO8         ==>                                           
+ *   Nema Step     <===  GPIO2    -|D4        SD2|- GPIO9         ==>                   r
+ *   Nema Dir      <===  GPIO0    -|D3        SD3|- GPIO10        ==>
+ *   Right PWM     <===  GPIO4    -|D2       VUSB|- reserved     
+ *   HX711 DAT     <===  GPIO5    -|D1   ANT. GND|- Reserved     
+ *                 <===  GPIO16   -|D0___ANT.__A0|- ADC           ==>      
+ * 
+ * 
+ * Logic for nodes 
+ * given a node has a number n, it's read only sensors from ESP point of view will be 200+n+{1-5}(5 read only sensors per node) 
+ * its command channels (digital for the moment) will be 100+n+{1-5}
+ * so to read a value of sensor m on node n, ESP will check I2c channel 200+m+n 
+ * to send a command to actuator m on node n, domoticz will send a http://<esp-IP>/control?cmd=EXTGPIO,100+m+n,0 or 1 
+ * as ESP don't know what type of actuator to run, and is busy with it's i2c role, it is the responsibility of this relay code to determine what type of command to actually run (can be anyhing : DIOremote, flick a relay, etc) 
+ * for command the value received from the gateway via RF433 are 
+ * verb = my node number in  char (0 must be avoided) 
+ * value = anything from 0 to 255 (uint8_t) 
+ * so to know if we have to react to this command we will use the value received, and if it is in our action range (node number to node number + 5) 
+***********************************************************************************************************************/
+const char Version[] = "ESPRelayNode50V23";
+uint8_t G_RFTXPin = D5; // i.e. GPIO 5 ,
+uint8_t G_RFRXPin = D2; // i.e. GPIO 4 ,
+// use 99 if no pin is attached 
+uint8_t my_blueLed = 99; // 
+uint8_t my_greenLed = 99; // 
+uint8_t my_redLed = 99;  // 
+uint8_t mySensorPin = A0; // my (only) sensor is = pin 3  
+uint8_t pinsToTransmit[5] = {13,13,15,15,15}; // these pins will be switched to input (pinMode(xxx, INPUT) so they cannot be the same as relaypins under
+int LUXPinsNumber[5]={9,10,0,0,0}; // these are the (Digital) pin numbers where we expect to find a LUX (an electric relay or similar) to switch on or off!
+const uint8_t datalength = 16; // size of the whole frame (fixed size) 
+const uint8_t rxlength = 16; // size of the whole frame (fixed size) 
+uint8_t data[16]; // this contains the whole frame to send, including payload and control chars
+unsigned long clearCMDHistoryAfterMicros = 30000000; 
+char histCommandSummary[6][5] = {"0000","1111","2222","3333","4444","5555"};
+const char dio[4] = "DIO";
+char G_thisNodeCommands[5][4] = {"LUX","DIO","DIO","DIO","DIO"}; // type of commands that this node will access (from actuator 0 to actuator 4) i2c port-100+(0=LUX,1=LUX,2=DIO,3=DIO,4=any) 
+// DIO codes for DIO nodes 0-4 (on,off,on,off...)
+unsigned long CCode[10] = {0,0,1212285072,1212285056,1212285076,1212285060,1212285084,1212285068,1212285074,1212285058}; // DIOCODEs to send if configured in G_thisNodeCommands above
+unsigned long G_IRCode[10] = {3772793023,3772793023,3772833823,3772829743,0,1,0,1,0,1}; // IRCODEs to send if configured in G_thisNodeCommands above
+//////////////////////////////////////////////////
+boolean received = false; 
+//////////////////////////////////////////////////
+// configuration for this node when not relaying  
+unsigned long lastTimeSensorsWereSentMicros = 0; 
+#ifdef DHTPRESENT
+#define DHTPIN 12     // what pin we're connecting to DHT22 sensor, pseudo pin allowing to send temperature from DHT22
+#define DHTPIN2 13    // Pseudo pin number to allow sending humidity from DHT22
+#define DHTTYPE DHT22   // DHT 22  (AM2302)
+DHT dht(DHTPIN, DHTTYPE); //// Initialize DHT sensor for normal 16mhz Arduino
+#endif
+unsigned long microsBeforeSendingMySensor = 60000000; // in microseconds
+boolean relayMode = false; // decide if this node is an end active node (rx/tx/actuator) or also a relay node 
+uint8_t password = 123; // transmission password *used to validate sender*
+char httpPassword[4] = "123" ; 
+uint8_t myExpectedPassword = 123; // expected password for relayed frames 
+#define NODE_NUMBER 50 // 0 to 254, unique for each emmitor node.. this#define line is not used by generic code, can be removed from here 
+uint8_t nodeNumber = 50; // 0 to 254, unique for each emmitor node
+char G_myVerb[4] = "R50" ; // that's the verb used when we are transmitting our own sensors. 
+
+DiOremote myRemote = DiOremote(G_RFTXPin);
+#define DiOremote_DEFAULT_TRY_COUNT 50
+#define DiOremote_START_FRAME_1 220  // ok 
+#define DiOremote_START_FRAME_0 2700 // ok 
+#define DiOremote_THIGH 250 // testing 
+#define DiOremote_TLOW_0 150 // testing 
+#define DiOremote_TLOW_1 1300
+#define DiOremote_END_FRAME_1 220
+#define DiOremote_END_FRAME_0 10600
+// Wifi setup 
+const char* Wssid     = "<SSID>";
+const char* Wpassword = "<Wpassword>";
+const char* Domohost = "<xxx.xxx.xxx.xxx>"; address of domoticz local host. 
+const int  port = 8080;
+// instanciate Web objects 
+ESP8266WebServer server ( 80 );
+HTTPClient http;
+// include the generic code defined in C:\Users\po\ownCloud\perso\Everycircuit\nano\libraries\HomerCommon
+#include <ESPGenericHomerRelay.v23.h>
